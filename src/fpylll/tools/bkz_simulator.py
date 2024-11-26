@@ -2,8 +2,8 @@
 """
 This file implements two BKZ simulation algorithms as proposed in
 
-- Chen, Y., & Nguyen, P. Q. (2011). BKZ 2.0: better lattice security estimates. In D. H. Lee, & X.
-  Wang, ASIACRYPT~2011 (pp. 1–20). : Springer, Heidelberg.
+- Chen, Y., & Nguyen, P. Q. (2011). BKZ 2.0: better lattice security estimates.
+  In D. H. Lee, & X.  Wang, ASIACRYPT~2011 (pp. 1–20). : Springer, Heidelberg.
 
 - Bai, S., & Stehlé, D. & Wen, W. (2018). Measuring, simulating and exploiting
   the head concavity phenomenon in BKZ. In T. Peyrin, & S. Galbraith,
@@ -13,6 +13,7 @@ This file implements two BKZ simulation algorithms as proposed in
 .. moduleauthor:: Martin R. Albrecht <fplll-devel@googlegroups.com> (2018)
 .. moduleauthor:: Shi Bai <fplll-devel@googlegroups.com> (2020)
 .. moduleauthor:: Fernando Virdia <fernando.virdia.2016@rhul.ac.uk> (2020)
+.. moduleauthor:: Ludo Pulles <lnp@cwi.nl> (2024)
 
 """
 from copy import copy
@@ -27,6 +28,8 @@ from fpylll.fplll.integer_matrix import IntegerMatrix
 from fpylll.fplll.gso import MatGSO, GSO
 from fpylll import FPLLL
 
+# Line 2, Algorithm 2 of [CN11]:
+# Average log2(||b_k*||) of an HKZ-reduced random unit-volume 45-dim lattice.
 rk = (
     0.789527997160000,
     0.780003183804613,
@@ -76,6 +79,19 @@ rk = (
 )
 
 
+def _lg_gh(d):
+    """
+    Return the logarithm (base 2) of the Gaussian Heuristic, GH(d).
+    Here GH(d) is the expected length of the shortest nonzero vector in a
+    random lattice of dimension d.
+    :param d: dimension
+    """
+    if d <= 45:
+        return rk[-d] - sum(rk[-d:]) / d
+    log_gh = lgamma(d / 2.0 + 1) * (1.0 / d) - log(sqrt(pi))
+    return log_gh / log(2.0)
+
+
 def _extract_log_norms(r):
     if isinstance(r, IntegerMatrix):
         r = GSO.Mat(r)
@@ -84,29 +100,115 @@ def _extract_log_norms(r):
         r = r.r()
     else:
         for ri in r:
-            if (ri <= 0):
+            if ri <= 0:
                 raise ValueError("squared norms in r should be positive")
 
     # code uses log2 of norms, FPLLL uses squared norms
-    r = list(map(lambda x: log(x, 2) / 2.0, r))
-    return r
+    return list(map(lambda x: log(x, 2) / 2.0, r))
+
+
+def log_simulate(basis_profile, beta, max_loops=False, verbose=False):
+    """
+    Simulate the evolution of the basis profile when running multiple tours of
+    BKZ-beta, using the simulator Algorithm 1 in [CN11].
+
+    :param basis_profile: log2(norm) of the GSO vectors of the basis.
+    :param max_loops: maximum number of full tours in BKZ to perform.
+                      BKZ terminates earlier if no progress is made in a tour.
+    :param beta: block size for BKZ.
+    :returns: tuple containing:
+              1. the basis profile after BKZ finished,
+              2. number of tours performed.
+    """
+    profile, n = copy(basis_profile), len(basis_profile)
+    assert 2 <= beta <= n
+
+    lg_ghs = [0] + [_lg_gh(i) for i in range(1, beta + 1)]
+    if not max_loops:
+        max_loops = n
+
+    for j in range(max_loops):
+        lg_volume = sum(profile[:beta])  # lg_volume = sum(profile[k:f])
+        updated = False
+        for k in range(0, n - 1):
+            f = min(k + beta, n)  # end index (excl.) of local block [k, f)
+            d = f - k  # dimension of local block
+            svp_sol = lg_volume/d + lg_ghs[d]
+            if updated or svp_sol < profile[k]:
+                profile[k] = svp_sol
+                updated = True
+
+            lg_volume -= profile[k]  # Remove ||b_k*|| from the sliding window
+            if f < n:
+                lg_volume += profile[f]  # Add ||b_f*|| to the sliding window
+        profile[-1] = lg_volume  # sum(profile) = lg(det L)
+        if not updated:
+            return profile, j + 1  # Early termination (unlikely)
+        if verbose:
+            sq_gs = [2.0 ** (2 * x) for x in profile]
+            stats = {'i': j} | basis_quality(sq_gs)
+            print(pretty_dict(OrderedDict(stats)))
+
+    return profile, max_loops
+
+
+def simulate2(r, param):
+    """
+    BKZ simulation algorithm as proposed by Chen and Nguyen [CN11].  This
+    version terminates when no substantial progress is made anymore or when
+    ``max_loops`` tours were simulated. If no ``max_loops`` is given, at most
+    ``d`` tours are performed, where ``d`` is the dimension of the lattice.
+    :param r: squared norms of the GSO vectors of the basis.
+    :param param: BKZ parameters (block_size, max_loops, verbose)
+    :returns: tuple with:
+              1. the reduced squared norms of the GSO vectors of the basis,
+              2. and the number of BKZ tours simulated.
+    EXAMPLE:
+        >>> from fpylll import IntegerMatrix, GSO, LLL, FPLLL, BKZ
+        >>> FPLLL.set_random_seed(1337)
+        >>> A = LLL.reduction(IntegerMatrix.random(100, "qary", bits=30, k=50))
+        >>> M = GSO.Mat(A)
+        >>> from fpylll.tools.bkz_simulator import simulate2
+        >>> _ = simulate2(M, BKZ.Param(block_size=2, max_loops=4, flags=BKZ.VERBOSE))
+        {"i":        0,  "r_0":   2^35.2,  "r_0/gh": 7.720730,  "rhf": 1.019532,  "/": -0.08309,  "hv/hv": 2.831284}
+        {"i":        1,  "r_0":   2^35.2,  "r_0/gh": 7.513168,  "rhf": 1.019393,  "/": -0.08300,  "hv/hv": 2.828248}
+        {"i":        2,  "r_0":   2^35.2,  "r_0/gh": 7.492349,  "rhf": 1.019379,  "/": -0.08291,  "hv/hv": 2.825635}
+        {"i":        3,  "r_0":   2^35.1,  "r_0/gh": 7.427548,  "rhf": 1.019335,  "/": -0.08282,  "hv/hv": 2.822987}
+        >>> _ = simulate2(M, BKZ.Param(block_size=40, max_loops=4, flags=BKZ.VERBOSE))
+        {"i":        0,  "r_0":   2^34.7,  "r_0/gh": 5.547855,  "rhf": 1.017849,  "/": -0.06928,  "hv/hv": 2.406481}
+        {"i":        1,  "r_0":   2^34.2,  "r_0/gh": 3.894188,  "rhf": 1.016049,  "/": -0.06136,  "hv/hv": 2.150078}
+        {"i":        2,  "r_0":   2^33.8,  "r_0/gh": 2.949459,  "rhf": 1.014638,  "/": -0.05735,  "hv/hv": 2.044402}
+        {"i":        3,  "r_0":   2^33.6,  "r_0/gh": 2.574565,  "rhf": 1.013949,  "/": -0.05556,  "hv/hv": 1.999163}
+    """
+    profile, num_loops = log_simulate(
+        _extract_log_norms(r), param.block_size, param.max_loops,
+        param.flags & BKZ.VERBOSE
+    )
+    return [2.0 ** (2 * x) for x in profile], num_loops
 
 
 def simulate(r, param):
     """
-    BKZ simulation algorithm as proposed by Chen and Nguyen in "BKZ 2.0: Better Lattice Security
-    Estimates".  Returns the reduced squared norms of the GSO vectors of the basis and the number of
-    BKZ tours simulated.  This version terminates when no substantial progress is made anymore or at
-    most ``max_loops`` tours were simulated.  If no ``max_loops`` is given, at most ``d`` tours are
-    performed, where ``d`` is the dimension of the lattice.
+    BKZ simulation algorithm as proposed by Chen and Nguyen [CN11].  This
+    version terminates when no substantial progress is made anymore or when
+    ``max_loops`` tours were simulated. If no ``max_loops`` is given, at most
+    ``d`` tours are performed, where ``d`` is the dimension of the lattice.
     :param r: squared norms of the GSO vectors of the basis.
     :param param: BKZ parameters
+    :returns: tuple with:
+              1. the reduced squared norms of the GSO vectors of the basis,
+              2. and the number of BKZ tours simulated.
     EXAMPLE:
         >>> from fpylll import IntegerMatrix, GSO, LLL, FPLLL, BKZ
         >>> FPLLL.set_random_seed(1337)
         >>> A = LLL.reduction(IntegerMatrix.random(100, "qary", bits=30, k=50))
         >>> M = GSO.Mat(A)
         >>> from fpylll.tools.bkz_simulator import simulate
+        >>> _ = simulate(M, BKZ.Param(block_size=2, max_loops=4, flags=BKZ.VERBOSE))
+        {"i":        0,  "r_0":   2^35.2,  "r_0/gh": 7.720730,  "rhf": 1.019532,  "/": -0.08309,  "hv/hv": 2.831284}
+        {"i":        1,  "r_0":   2^35.2,  "r_0/gh": 7.513168,  "rhf": 1.019393,  "/": -0.08300,  "hv/hv": 2.828248}
+        {"i":        2,  "r_0":   2^35.2,  "r_0/gh": 7.492349,  "rhf": 1.019379,  "/": -0.08291,  "hv/hv": 2.825635}
+        {"i":        3,  "r_0":   2^35.1,  "r_0/gh": 7.427548,  "rhf": 1.019335,  "/": -0.08282,  "hv/hv": 2.822987}
         >>> _ = simulate(M, BKZ.Param(block_size=40, max_loops=4, flags=BKZ.VERBOSE))
         {"i":        0,  "r_0":   2^34.7,  "r_0/gh": 5.547855,  "rhf": 1.017849,  "/": -0.06928,  "hv/hv": 2.406481}
         {"i":        1,  "r_0":   2^34.2,  "r_0/gh": 3.894188,  "rhf": 1.016049,  "/": -0.06136,  "hv/hv": 2.150078}
@@ -120,11 +222,7 @@ def simulate(r, param):
 
     r1 = copy(r)
     r2 = copy(r)
-    c = [rk[-i] - sum(rk[-i:]) / i for i in range(1, 46)]
-    c += [
-        (lgamma(beta / 2.0 + 1) * (1.0 / beta) - log(sqrt(pi))) / log(2.0)
-        for beta in range(46, param.block_size + 1)
-    ]
+    lg_ghs = [0] + [_lg_gh(i) for i in range(1, param.block_size + 1)]
 
     if param.max_loops:
         N = param.max_loops
@@ -137,7 +235,7 @@ def simulate(r, param):
             beta = min(param.block_size, d - k)
             f = k + beta
             logV = sum(r1[:f]) - sum(r2[:k])
-            lma = logV / beta + c[beta - 1]
+            lma = logV / beta + lg_ghs[beta]
             if phi:
                 if lma < r1[k]:
                     r2[k] = lma
@@ -175,14 +273,15 @@ def simulate(r, param):
 
 def simulate_prob(r, param, prng_seed=0xdeadbeef):
     """
-    BKZ simulation algorithm as proposed by Bai and Stehlé and Wen in "Measuring, simulating and
-    exploiting the head concavity phenomenon in BKZ".  Returns the reduced squared norms of the
-    GSO vectors of the basis and the number of BKZ tours simulated.  This version terminates when
-    no substantial progress is made anymore or at most ``max_loops`` tours were simulated.
-    If no ``max_loops`` is given, at most ``d`` tours are performed, where ``d`` is the dimension
-    of the lattice.
+    BKZ simulation algorithm as proposed by Bai, Stehlé and Wen [BSW18].  This
+    version terminates when no substantial progress is made anymore or when
+    ``max_loops`` tours were simulated. If no ``max_loops`` is given, at most
+    ``d`` tours are performed, where ``d`` is the dimension of the lattice.
     :param r: squared norms of the GSO vectors of the basis.
     :param param: BKZ parameters
+    :returns: tuple with:
+              1. the reduced squared norms of the GSO vectors of the basis,
+              2. and the number of BKZ tours simulated.
     EXAMPLE:
         >>> from fpylll import IntegerMatrix, GSO, LLL, FPLLL, BKZ
         >>> FPLLL.set_random_seed(1337)
@@ -208,11 +307,7 @@ def simulate_prob(r, param, prng_seed=0xdeadbeef):
 
     r1 = copy(r)
     r2 = copy(r)
-    c = [rk[-j] - sum(rk[-j:]) / j for j in range(1, 46)]
-    c += [
-        (lgamma(beta / 2.0 + 1) * (1.0 / beta) - log(sqrt(pi))) / log(2.0)
-        for beta in range(46, param.block_size + 1)
-    ]
+    lg_ghs = [0] + [_lg_gh(i) for i in range(1, param.block_size + 1)]
 
     if param.max_loops:
         N = param.max_loops
@@ -231,7 +326,7 @@ def simulate_prob(r, param, prng_seed=0xdeadbeef):
             logV = sum(r1[:f]) - sum(r2[:k])
             if phi:
                 X = random.expovariate(.5)
-                lma = (log(X, 2) + logV) / beta + c[beta - 1]
+                lma = (log(X, 2) + logV) / beta + lg_ghs[beta]
                 if lma < r1[k]:
                     r2[k] = lma
                     r2[k+1] = r1[k] + log(sqrt(1-1./beta), 2)
@@ -252,7 +347,7 @@ def simulate_prob(r, param, prng_seed=0xdeadbeef):
         beta = min(45, param.block_size)
         logV = sum(r1) - sum(r2[:-beta])
         if param.block_size < 45:
-            rk1 = normalize_GSO_unitary(rk[-beta:])
+            rk1 = normalize_gso_unitary(rk[-beta:])
         else:
             rk1 = rk
         K = range(d-beta, d)
@@ -277,22 +372,23 @@ def simulate_prob(r, param, prng_seed=0xdeadbeef):
     return r1, i + 1
 
 
-def normalize_GSO_unitary(l):
-    log_det = sum(l)
-    n = len(l)
-    nor_log_det = [0.0] * n
-    for i in range(n):
-        nor_log_det[i] = l[i] - log_det/n
-    return nor_log_det
+def normalize_gso_unitary(rk):
+    log_det, n = sum(rk), len(rk)
+    return [rk[i] - log_det/n for i in range(n)]
 
 
 def averaged_simulate_prob(L, param, tries=10):
     """
     This wrapper calls the [BSW18] probabilistic BKZ simulator with different
     PRNG seeds, and returns the average output.
+    Note: exp(E[ log(X_i) ]) is reported where X_i is the squared norm of the
+    i-th GSO vector.
     :param r: squared norms of the GSO vectors of the basis.
     :param param: BKZ parameters
-    :tries: number of iterations to average over. Default: 10
+    :param tries: number of iterations to average over. Default: 10
+    :returns: tuple with:
+              1. averaged reduced squared norms of GSO vectors of the basis,
+              2. the averaged number of BKZ tours simulated.
     EXAMPLE:
         >>> from fpylll import IntegerMatrix, GSO, LLL, FPLLL, BKZ
         >>> FPLLL.set_random_seed(1337)
